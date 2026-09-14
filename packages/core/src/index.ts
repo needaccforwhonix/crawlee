@@ -1,19 +1,18 @@
-export * from './errors';
-export * from './autoscaling';
-export * from './configuration';
-export * from './crawlers';
-export * from './enqueue_links';
-export * from './events';
-export * from './http_clients';
-export * from './log';
-export * from './proxy_configuration';
-export * from './request';
-export * from './router';
-export * from './serialization';
-export * from './session_pool';
-export * from './storages';
-export * from './validators';
-export * from './cookie_utils';
-export * from './recoverable_state';
-export { PseudoUrl } from '@apify/pseudo_url';
-export { Dictionary, Awaitable, Constructor, StorageClient, Cookie, QueueOperationInfo } from '@crawlee/types';
+export * from './debug.js';
+export * from './errors.js';
+export * from './configuration.js';
+export * from './service_locator.js';
+export * from './events/index.js';
+export * from './log.js';
+export * from './owned_or_injected.js';
+export * from './proxy_configuration.js';
+export * from './request.js';
+export * from './serialization.js';
+export * from './storages/index.js';
+export * from './memory-storage/index.js';
+// Not `export *`: the rest of the module re-exports `@crawlee/utils/internal` symbols, which carry no
+// semver guarantees and must not reach the public surface. Internal consumers import them directly.
+export { ArgumentValidationError, validators } from './validators.js';
+export * from './recoverable_state.js';
+export type { StorageBackend } from '@crawlee/types';
+export { EnqueueStrategy } from '@crawlee/utils';

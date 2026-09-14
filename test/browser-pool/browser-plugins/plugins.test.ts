@@ -14,11 +14,18 @@ import {
 } from '@crawlee/browser-pool';
 import playwright from 'playwright';
 import type { Server as ProxyChainServer } from 'proxy-chain';
+// @ts-ignore This only throws when compiled against puppeteer 25+ (ESM only), we only import types, so its alllll gooooood
 import type { Browser } from 'puppeteer';
+// @ts-ignore This only throws when compiled against puppeteer 25+ (ESM only), vitest executes tests as ESM, so its alllll gooooood
 import puppeteer from 'puppeteer';
-import { runExampleComServer } from 'test/shared/_helper';
+import { runExampleComServer } from '../../shared/_helper.js';
 
-import { createProxyServer } from './create-proxy-server';
+import { createProxyServer } from './create-proxy-server.js';
+
+// Chromium goes through the tests faster than Firefox and the results are more useful than with
+// webkit. CI and `pnpm test:full` set CRAWLEE_TEST_BROWSERS to the full list.
+const requestedBrowsers = (process.env.CRAWLEE_TEST_BROWSERS ?? 'chromium').split(',');
+const testedBrowsers = (['chromium', 'firefox', 'webkit'] as const).filter((name) => requestedBrowsers.includes(name));
 
 // Firefox browser launch is significantly slower than Chromium/WebKit (~12s vs <1s).
 // Under CPU load from parallel tests, it can exceed 2 minutes. Use 5 minute timeout.
@@ -80,7 +87,7 @@ const runPluginTest = <
                 id,
                 launchOptions,
                 browserPlugin: plugin,
-                _proxyUrl: proxyUrl.slice(0, -1),
+                proxyUrl: proxyUrl.slice(0, -1),
                 one: 1,
                 useIncognitoPages: false,
             };
@@ -91,7 +98,7 @@ const runPluginTest = <
             expect(context.id).toEqual(desiredObject.id);
             expect(context.launchOptions).toEqual(desiredObject.launchOptions);
             expect(context.browserPlugin).toEqual(desiredObject.browserPlugin);
-            expect(context['_proxyUrl']).toEqual(desiredObject._proxyUrl); // eslint-disable-line
+            expect(context.proxyUrl).toEqual(desiredObject.proxyUrl);
             expect(context.one).toEqual(desiredObject.one);
             expect(context.useIncognitoPages).toEqual(desiredObject.useIncognitoPages);
         });
@@ -110,6 +117,17 @@ const runPluginTest = <
             expect(context.proxyUrl).toEqual(proxyUrl.slice(0, -1));
             expect(context.useIncognitoPages).toBeTruthy();
             expect(context.userDataDir).toEqual('test');
+        });
+
+        test.concurrent('should allow unsetting launchContext proxyUrl', () => {
+            const plugin = new Plugin(library as never);
+            const context = plugin.createLaunchContext();
+
+            context.proxyUrl = 'http://proxy.com/';
+            expect(context.proxyUrl).toEqual('http://proxy.com');
+
+            context.proxyUrl = undefined;
+            expect(context.proxyUrl).toBeUndefined();
         });
 
         test.concurrent('should create browser controller', () => {
@@ -163,7 +181,7 @@ const runPluginTest = <
                     expect(false).toBe(true);
                 } catch (error: any) {
                     expect(error.message).toBe(
-                        'A new page can be created with provided context only when using incognito pages or experimental containers.',
+                        'A new page can be created with provided context only when using incognito pages.',
                     );
                 }
             } finally {
@@ -303,6 +321,18 @@ describe('Plugins', () => {
             }
         });
 
+        test.concurrent('should allow calling functions on the proxied browser', async () => {
+            const plugin = new PuppeteerPlugin(puppeteer);
+            const launchContext = plugin.createLaunchContext();
+            const browser = await plugin.launch(launchContext);
+
+            try {
+                await expect(browser.pages()).resolves.toBeDefined();
+            } finally {
+                await browser.close();
+            }
+        });
+
         test.concurrent('should pass launch options to browser', async () => {
             const plugin = new PuppeteerPlugin(puppeteer);
 
@@ -356,6 +386,38 @@ describe('Plugins', () => {
 
     runPluginTest(PuppeteerPlugin, PuppeteerController, puppeteer);
 
+    describe('normalizeProxyOptions', () => {
+        test.each([
+            ['socks5://user:pass@proxy.example.com:1080', 'socks5://proxy.example.com:1080'],
+            ['http://user:pass@proxy.example.com:8080', 'http://proxy.example.com:8080'],
+        ])('PlaywrightController should handle %s', (proxyUrl, expectedServer) => {
+            const plugin = new PlaywrightPlugin(playwright.chromium);
+            const browserController = new PlaywrightController(plugin);
+
+            const result = browserController.normalizeProxyOptions(proxyUrl, {});
+
+            expect(result).toMatchObject({
+                proxy: { server: expectedServer, username: 'user', password: 'pass' },
+            });
+        });
+
+        test.each([
+            ['socks5://user:pass@proxy.example.com:1080', 'socks5://proxy.example.com:1080'],
+            ['http://user:pass@proxy.example.com:8080', 'http://proxy.example.com:8080'],
+        ])('PuppeteerController should handle %s', (proxyUrl, expectedServer) => {
+            const plugin = new PuppeteerPlugin(puppeteer);
+            const browserController = new PuppeteerController(plugin);
+
+            const result = browserController.normalizeProxyOptions(proxyUrl, {});
+
+            expect(result).toMatchObject({
+                proxyServer: expectedServer,
+                proxyUsername: 'user',
+                proxyPassword: 'pass',
+            });
+        });
+    });
+
     describe('Playwright specifics', () => {
         let browser: playwright.Browser;
 
@@ -363,7 +425,7 @@ describe('Plugins', () => {
             await browser.close();
         });
 
-        describe.each(['chromium', 'firefox', 'webkit'] as const)('with %s', (browserName) => {
+        describe.each(testedBrowsers)('with %s', (browserName) => {
             test('should work with non authenticated proxyUrl', async () => {
                 const proxyUrl = `http://127.0.0.2:${unprotectedProxy.port}`;
                 const plugin = new PlaywrightPlugin(playwright[browserName]);
@@ -569,6 +631,20 @@ describe('Plugins', () => {
                     expect(version1).toEqual(browser.version());
                 });
 
+                test('should return browser type', async () => {
+                    const plugin = new PlaywrightPlugin(playwright[browserName]);
+
+                    const launchContext = plugin.createLaunchContext({ useIncognitoPages: false });
+                    browser = await plugin.launch(launchContext);
+                    expect(browser.browserType()).toBe(playwright[browserName]);
+
+                    await browser.close();
+
+                    const launchContext2 = plugin.createLaunchContext({ useIncognitoPages: true });
+                    browser = await plugin.launch(launchContext2);
+                    expect(browser.browserType()).toBe(playwright[browserName]);
+                });
+
                 test('should return all contexts', async () => {
                     const plugin = new PlaywrightPlugin(playwright[browserName]);
 
@@ -577,8 +653,9 @@ describe('Plugins', () => {
                     const contexts = browser.contexts();
                     expect(contexts).toHaveLength(1);
 
-                    // Cast to any to access private property
-                    expect(contexts[0]).toEqual((browser as any)._browserContext);
+                    // the returned context is the one new pages are created in
+                    const page = await browser.newPage();
+                    expect(page.context()).toBe(contexts[0]);
                 });
 
                 test('should return correct connected status', async () => {
@@ -626,7 +703,7 @@ describe('Plugins', () => {
         });
     });
 
-    runPluginTest(PlaywrightPlugin, PlaywrightController, playwright.chromium);
-    runPluginTest(PlaywrightPlugin, PlaywrightController, playwright.firefox);
-    runPluginTest(PlaywrightPlugin, PlaywrightController, playwright.webkit);
+    for (const browserName of testedBrowsers) {
+        runPluginTest(PlaywrightPlugin, PlaywrightController, playwright[browserName]);
+    }
 });

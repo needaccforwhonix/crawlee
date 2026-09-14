@@ -1,16 +1,20 @@
+import type { BaseHttpClient } from '@crawlee/http-client';
 import type { Dictionary } from '@crawlee/types';
 import { downloadListOfUrls } from '@crawlee/utils';
-import ow, { ArgumentError } from 'ow';
+import { z } from 'zod';
 
-import { Configuration } from '../configuration';
-import type { EventManager } from '../events';
-import { EventType } from '../events';
-import { log } from '../log';
-import type { ProxyConfiguration } from '../proxy_configuration';
-import { type InternalSource, Request, type RequestOptions, type Source } from '../request';
-import { createDeserialize, serializeArray } from '../serialization';
-import { KeyValueStore } from './key_value_store';
-import { purgeDefaultStorages } from './utils';
+import type { Configuration } from '../configuration.js';
+import type { CrawleeLogger } from '../log.js';
+import type { IProxyConfiguration } from '../proxy_configuration.js';
+import { convertStateSync, RecoverableState } from '../recoverable_state.js';
+import { type InternalSource, Request, type RequestOptions, type Source } from '../request.js';
+import { createDeserialize, serializeArray } from '../serialization.js';
+import { serviceLocator } from '../service_locator.js';
+import { parseArgument, schemas, validators } from '../validators.js';
+import { KeyValueStore } from './key_value_store.js';
+import type { IRequestLoader, RequestLoaderStatus } from './request_loader.js';
+import type { IRequestManager } from './request_manager.js';
+import { purgeDefaultStorages } from './utils.js';
 
 /** @internal */
 export const STATE_PERSISTENCE_KEY = 'REQUEST_LIST_STATE';
@@ -20,72 +24,107 @@ export const REQUESTS_PERSISTENCE_KEY = 'REQUEST_LIST_REQUESTS';
 
 const CONTENT_TYPE_BINARY = 'application/octet-stream';
 
+const persistedRequestListState = z.object({
+    nextIndex: z.number().int().nonnegative(),
+    nextUniqueKey: z.string().nullable(),
+    inProgress: z.array(z.string()),
+});
+
+const requestListInternalState = z.object({
+    /** Position of the next request to be processed. */
+    nextIndex: z.number().int().nonnegative(),
+    /** `uniqueKey`s of the requests being processed at the moment. */
+    inProgress: z.set(z.string()),
+});
+
+/** The live crawling position of a {@apilink RequestList}, as kept by its {@apilink RecoverableState}. */
+type RequestListInternalState = z.infer<typeof requestListInternalState>;
+
+const requestListOptionsSchema = z.strictObject({
+    sources: schemas.anyArray.optional(), // check only for array and not subtypes to avoid iteration over the whole thing
+    sourcesFunction: schemas.anyFunction.optional(),
+    persistStateKey: z.string().optional(),
+    persistRequestsKey: z.string().optional(),
+    state: persistedRequestListState.optional(),
+    keepDuplicateUrls: z.boolean().default(false),
+    proxyConfiguration: validators.proxyConfiguration.optional(),
+    httpClient: schemas.httpClient.optional(),
+});
+const listNameSchema = z.string().nullish();
+const openOptionsSchema = z.looseObject({});
+
 /**
- * Represents a static list of URLs to crawl.
+ * The conversion between the crawling position and its persisted record. Decoding also checks the record against
+ * the loaded requests, which is why the codec is built per list.
  */
-export interface IRequestList {
-    /**
-     * Returns the total number of unique requests present in the list.
-     */
-    length(): number;
+function buildRequestListStateCodec(list: {
+    requests: readonly (Request | RequestOptions)[];
+    indexOf: (uniqueKey: string) => number | undefined;
+    log: CrawleeLogger;
+}) {
+    return z.codec(persistedRequestListState, requestListInternalState, {
+        decode: (record, ctx) => {
+            const { requests } = list;
+            const { nextIndex, nextUniqueKey } = record;
+            const inconsistent = (message: string) => {
+                ctx.issues.push({ code: 'custom', message, input: record });
+                return z.NEVER;
+            };
 
-    /**
-     * Returns `true` if all requests were already handled and there are no more left.
-     */
-    isFinished(): Promise<boolean>;
+            if (nextIndex > requests.length) {
+                return inconsistent('The state object is not consistent with RequestList, too few requests loaded.');
+            }
+            if (nextIndex < requests.length && requests[nextIndex].uniqueKey !== nextUniqueKey) {
+                return inconsistent(
+                    'The state object is not consistent with RequestList the order of URLs seems to have changed.',
+                );
+            }
 
-    /**
-     * Resolves to `true` if the next call to {@apilink IRequestList.fetchNextRequest} function
-     * would return `null`, otherwise it resolves to `false`.
-     * Note that even if the list is empty, there might be some pending requests currently being processed.
-     */
-    isEmpty(): Promise<boolean>;
+            const inProgress = new Set(record.inProgress);
+            const deleteFromInProgress: string[] = [];
+            for (const uniqueKey of inProgress) {
+                const index = list.indexOf(uniqueKey);
+                if (index === undefined) {
+                    return inconsistent(
+                        'The state object is not consistent with RequestList. Unknown uniqueKey is present in the state.',
+                    );
+                }
+                if (index >= nextIndex) {
+                    deleteFromInProgress.push(uniqueKey);
+                }
+            }
 
-    /**
-     * Returns number of handled requests.
-     */
-    handledCount(): number;
+            // WORKAROUND:
+            // It happened to some users that state object contained something like:
+            // {
+            //   "nextIndex": 11308,
+            //   "nextUniqueKey": "https://www.anychart.com",
+            //   "inProgress": {
+            //      "https://www.ams360.com": true,
+            //      ...
+            //        "https://www.anychart.com": true,
+            // }
+            // Which then caused error "The request is not being processed (uniqueKey: https://www.anychart.com)"
+            // As a workaround, we just remove all inProgress requests whose index >= nextIndex,
+            // since they will be crawled again.
+            if (deleteFromInProgress.length) {
+                list.log.warning(
+                    "RequestList's in-progress field is not consistent, skipping invalid in-progress entries",
+                    { deleteFromInProgress },
+                );
+                for (const uniqueKey of deleteFromInProgress) {
+                    inProgress.delete(uniqueKey);
+                }
+            }
 
-    /**
-     * Persists the current state of the `IRequestList` into the default {@apilink KeyValueStore}.
-     * The state is persisted automatically in regular intervals, but calling this method manually
-     * is useful in cases where you want to have the most current state available after you pause
-     * or stop fetching its requests. For example after you pause or abort a crawl. Or just before
-     * a server migration.
-     */
-    persistState(): Promise<void>;
-
-    /**
-     * Gets the next {@apilink Request} to process. First, the function gets a request previously reclaimed
-     * using the {@apilink RequestList.reclaimRequest} function, if there is any.
-     * Otherwise it gets the next request from sources.
-     *
-     * The function's `Promise` resolves to `null` if there are no more
-     * requests to process.
-     */
-    fetchNextRequest(): Promise<Request | null>;
-
-    /**
-     * Can be used to iterate over the `RequestList` instance in a `for await .. of` loop.
-     * Provides an alternative for the repeated use of `fetchNextRequest`.
-     */
-    [Symbol.asyncIterator](): AsyncGenerator<Request>;
-
-    /**
-     * Reclaims request to the list if its processing failed.
-     * The request will become available in the next `this.fetchNextRequest()`.
-     */
-    reclaimRequest(request: Request): Promise<void>;
-
-    /**
-     * Marks request as handled after successful processing.
-     */
-    markRequestHandled(request: Request): Promise<void>;
-
-    /**
-     * @internal
-     */
-    inProgress: Set<string>;
+            return { nextIndex, inProgress };
+        },
+        encode: ({ nextIndex, inProgress }) => ({
+            nextIndex,
+            nextUniqueKey: nextIndex < list.requests.length ? list.requests[nextIndex].uniqueKey! : null,
+            inProgress: [...inProgress],
+        }),
+    });
 }
 
 export interface RequestListOptions {
@@ -169,7 +208,7 @@ export interface RequestListOptions {
      * Takes advantage of the internal address rotation and authentication process.
      * If undefined, the `requestsFromUrl` requests will be made without proxy.
      */
-    proxyConfiguration?: ProxyConfiguration;
+    proxyConfiguration?: IProxyConfiguration;
 
     /**
      * Identifies the key in the default key-value store under which `RequestList` periodically stores its
@@ -211,7 +250,8 @@ export interface RequestListOptions {
      * ```
      *
      * Note that the preferred (and simpler) way to persist the state of crawling of the `RequestList`
-     * is to use the `stateKeyPrefix` parameter instead.
+     * is to use the `stateKeyPrefix` parameter instead. When both are set, a record persisted under
+     * {@apilink RequestListOptions.persistStateKey} takes precedence over this option.
      */
     state?: RequestListState;
 
@@ -233,7 +273,14 @@ export interface RequestListOptions {
     keepDuplicateUrls?: boolean;
 
     /** @internal */
-    config?: Configuration;
+    configuration?: Configuration;
+
+    /**
+     * The HTTP client to be used to download `requestsFromUrl` URLs.
+     *
+     * If not specified the `RequestList` will use the default HTTP client.
+     */
+    httpClient?: BaseHttpClient;
 }
 
 /**
@@ -258,8 +305,8 @@ export interface RequestListOptions {
  * > In practical terms, such a combination can be useful when there is a large number of initial URLs,
  * > but more URLs would be added dynamically by the crawler.
  *
- * `RequestList` has an internal state where it stores information about which requests were already handled,
- * which are in progress and which were reclaimed. The state may be automatically persisted to the default
+ * `RequestList` has an internal state where it stores information about which requests were already handled
+ * and which are in progress. The state may be automatically persisted to the default
  * {@apilink KeyValueStore} by setting the `persistStateKey` option so that if the Node.js process is restarted,
  * the crawling can continue where it left off. The automated persisting is launched upon receiving the `persistState`
  * event that is periodically emitted by {@apilink EventManager}.
@@ -297,39 +344,40 @@ export interface RequestListOptions {
  * ```
  * @category Sources
  */
-export class RequestList implements IRequestList {
-    private log = log.child({ prefix: 'RequestList' });
+export class RequestList implements IRequestLoader {
+    #log: CrawleeLogger = serviceLocator.getLogger().child({ prefix: 'RequestList' });
 
     /**
      * Array of all requests from all sources, in the order as they appeared in sources.
      * All requests in the array have distinct uniqueKey!
      * @internal
      */
-    requests: (Request | RequestOptions)[] = [];
-
-    /** Index to the next item in requests array to fetch. All previous requests are either handled or in progress. */
-    private nextIndex = 0;
+    readonly requests: (Request | RequestOptions)[] = [];
 
     /** Dictionary, key is Request.uniqueKey, value is corresponding index in the requests array. */
-    private uniqueKeyToIndex: Record<string, number> = {};
+    #uniqueKeyToIndex: Record<string, number> = {};
+
+    /**
+     * The crawling position, kept in a {@apilink RecoverableState} that handles the loading, validation and
+     * periodic persistence of the record under `persistStateKey`.
+     */
+    readonly #state: RecoverableState<RequestListInternalState, RequestListState>;
+    readonly #stateCodec: ReturnType<typeof buildRequestListStateCodec>;
 
     /**
      * Set of `uniqueKey`s of requests that were returned by fetchNextRequest().
      * @internal
      */
-    inProgress = new Set<string>();
+    get inProgress(): Set<string> {
+        return this.#state.currentValue.inProgress;
+    }
 
     /**
-     * Set of `uniqueKey`s of requests for which reclaimRequest() was called.
+     * `uniqueKey`s of requests that were in progress when the state was last persisted and thus need to be
+     * re-crawled after a restart. They are served before advancing through the rest of the sources.
      * @internal
      */
-    reclaimed = new Set<string>();
-
-    /**
-     * Starts as true because until we handle the first request, the list is effectively persisted by doing nothing.
-     * @internal
-     */
-    isStatePersisted = true;
+    #requestsToRetry: string[] = [];
 
     /**
      * Starts as false because we don't know yet and sources might change in the meantime (eg. download from live list).
@@ -337,17 +385,16 @@ export class RequestList implements IRequestList {
      */
     areRequestsPersisted = false;
 
-    private isLoading = false;
-    private isInitialized = false;
-    private persistStateKey?: string;
-    private persistRequestsKey?: string;
-    private initialState?: RequestListState;
-    private store?: KeyValueStore;
-    private keepDuplicateUrls: boolean;
-    private sources: RequestListSource[];
-    private sourcesFunction?: RequestListSourcesFunction;
-    private proxyConfiguration?: ProxyConfiguration;
-    private events: EventManager;
+    #isLoading = false;
+    #isInitialized = false;
+    #persistStateKey?: string;
+    #persistRequestsKey?: string;
+    #store?: KeyValueStore;
+    #keepDuplicateUrls: boolean;
+    #sources: RequestListSource[];
+    #sourcesFunction?: RequestListSourcesFunction;
+    #proxyConfiguration?: IProxyConfiguration;
+    #httpClient?: BaseHttpClient;
 
     /**
      * To create new instance of `RequestList` we need to use `RequestList.open()` factory method.
@@ -362,47 +409,52 @@ export class RequestList implements IRequestList {
             persistRequestsKey,
             state,
             proxyConfiguration,
-            keepDuplicateUrls = false,
-            config = Configuration.getGlobalConfig(),
-        } = options;
+            keepDuplicateUrls,
+            httpClient,
+        } = parseArgument(options, requestListOptionsSchema);
 
         if (!(sources || sourcesFunction)) {
-            throw new ArgumentError(
-                'At least one of "sources" or "sourcesFunction" must be provided.',
-                this.constructor,
-            );
+            throw new Error('At least one of "sources" or "sourcesFunction" must be provided.');
         }
-        ow(
-            options,
-            ow.object.exactShape({
-                sources: ow.optional.array, // check only for array and not subtypes to avoid iteration over the whole thing
-                sourcesFunction: ow.optional.function,
-                persistStateKey: ow.optional.string,
-                persistRequestsKey: ow.optional.string,
-                state: ow.optional.object.exactShape({
-                    nextIndex: ow.number,
-                    nextUniqueKey: ow.string,
-                    inProgress: ow.object,
-                }),
-                keepDuplicateUrls: ow.optional.boolean,
-                proxyConfiguration: ow.optional.object,
-            }),
-        );
 
-        this.persistStateKey = persistStateKey ? `SDK_${persistStateKey}` : persistStateKey;
-        this.persistRequestsKey = persistRequestsKey ? `SDK_${persistRequestsKey}` : persistRequestsKey;
-        this.initialState = state;
-        this.events = config.getEventManager();
+        this.#persistStateKey = persistStateKey ? `CRAWLEE_${persistStateKey}` : persistStateKey;
+        this.#persistRequestsKey = persistRequestsKey ? `CRAWLEE_${persistRequestsKey}` : persistRequestsKey;
+        this.#httpClient = httpClient;
+
+        this.#stateCodec = buildRequestListStateCodec({
+            requests: this.requests,
+            indexOf: (uniqueKey) => {
+                const index = this.#uniqueKeyToIndex[uniqueKey];
+                return typeof index === 'number' ? index : undefined;
+            },
+            log: this.#log,
+        });
+
+        const stateKey = this.#persistStateKey ?? STATE_PERSISTENCE_KEY;
+        this.#state = new RecoverableState({
+            // The `state` option is where the list starts when there is no persisted record to restore. The factory
+            // runs on `initialize()`, once the requests it is validated against are loaded.
+            defaultState: () =>
+                state
+                    ? convertStateSync(this.#stateCodec, state, stateKey)
+                    : { nextIndex: 0, inProgress: new Set<string>() },
+            persistStateKey: stateKey,
+            persistenceEnabled: !!this.#persistStateKey,
+            logger: this.#log,
+            // The codec validates in the decode direction, so it is a Standard Schema as-is; encoding needs a call.
+            deserialize: this.#stateCodec,
+            serialize: (internalState) => this.#stateCodec.encode(internalState),
+        });
 
         // If this option is set then all requests will get a pre-generated unique ID and duplicate URLs will be kept in the list.
-        this.keepDuplicateUrls = keepDuplicateUrls;
+        this.#keepDuplicateUrls = keepDuplicateUrls;
 
         // Will be empty after initialization to save memory.
-        this.sources = sources ? [...sources] : [];
-        this.sourcesFunction = sourcesFunction;
+        this.#sources = sources ? [...sources] : [];
+        this.#sourcesFunction = sourcesFunction;
 
         // The proxy configuration used for `requestsFromUrl` requests.
-        this.proxyConfiguration = proxyConfiguration;
+        this.#proxyConfiguration = proxyConfiguration;
     }
 
     /**
@@ -410,29 +462,35 @@ export class RequestList implements IRequestList {
      * This function must be called before you can start using the instance in a meaningful way.
      */
     private async initialize(): Promise<this> {
-        if (this.isLoading) {
+        if (this.#isLoading) {
             throw new Error('RequestList sources are already loading or were loaded.');
         }
 
-        this.isLoading = true;
+        this.#isLoading = true;
         await purgeDefaultStorages({ onlyPurgeOnce: true });
 
-        const [state, persistedRequests] = await this._loadStateAndPersistedRequests();
+        let persistedRequests: Buffer | undefined;
+        if (this.#persistRequestsKey) {
+            persistedRequests = await this.getPersistedState(this.#persistRequestsKey);
+            if (persistedRequests)
+                this.#log.debug('Loaded requests from key value store using the persistRequestsKey.');
+        }
 
         // Add persisted requests / new sources in a memory efficient way because with very
         // large lists, we were running out of memory.
         if (persistedRequests) {
-            await this._addPersistedRequests(persistedRequests as Buffer);
+            await this.addPersistedRequests(persistedRequests);
         } else {
-            await this._addRequestsFromSources();
+            await this.addRequestsFromSources();
         }
 
-        this._restoreState(state as RequestListState);
-        this.isInitialized = true;
-        if (this.persistRequestsKey && !this.areRequestsPersisted) await this._persistRequests();
-        if (this.persistStateKey) {
-            this.events.on(EventType.PERSIST_STATE, this.persistState.bind(this));
-        }
+        // Restores the crawling position - the requests have to be loaded first, as the record is validated
+        // against them. Also starts the periodic state persistence when `persistStateKey` is set.
+        await this.#state.initialize();
+        // All in-progress requests were interrupted and need to be re-crawled.
+        this.#requestsToRetry = [...this.inProgress];
+        this.#isInitialized = true;
+        if (this.#persistRequestsKey && !this.areRequestsPersisted) await this.persistRequests();
 
         return this;
     }
@@ -442,18 +500,19 @@ export class RequestList implements IRequestList {
      * This needs to be done in a memory efficient way. We should update the input
      * to a Stream once apify-client supports streams.
      */
-    protected async _addPersistedRequests(persistedRequests: Buffer): Promise<void> {
+    private async addPersistedRequests(persistedRequests: Buffer): Promise<void> {
         // We don't need the sources so we purge them to
         // prevent them from hanging in memory.
-        for (let i = 0; i < this.sources.length; i++) {
-            delete this.sources[i];
+        for (let i = 0; i < this.#sources.length; i++) {
+            // oxlint-disable-next-line typescript/no-array-delete -- intentional, drop the slot so V8 can collect the object
+            delete this.#sources[i];
         }
-        this.sources = [];
+        this.#sources = [];
 
         this.areRequestsPersisted = true;
         const requestStream = createDeserialize(persistedRequests);
         for await (const request of requestStream) {
-            this._addRequest(request);
+            this.addRequest(request);
         }
     }
 
@@ -463,34 +522,39 @@ export class RequestList implements IRequestList {
      * We need to avoid keeping both sources and requests in memory
      * to reduce memory footprint with very large sources.
      */
-    protected async _addRequestsFromSources(): Promise<void> {
+    private async addRequestsFromSources(): Promise<void> {
         // We'll load all sources in sequence to ensure that they get loaded in the right order.
-        const sourcesCount = this.sources.length;
+        const sourcesCount = this.#sources.length;
         for (let i = 0; i < sourcesCount; i++) {
-            const source = this.sources[i];
+            const source = this.#sources[i];
             // Using delete here to drop the original object ASAP to free memory
             // .pop would reverse the array and .shift is SLOW.
-            delete this.sources[i];
+            // oxlint-disable-next-line typescript/no-array-delete
+            delete this.#sources[i];
 
             if (typeof source === 'object' && (source as Dictionary).requestsFromUrl) {
-                const fetchedRequests = await this._fetchRequestsFromUrl(source as InternalSource);
-                await this._addFetchedRequests(source as InternalSource, fetchedRequests);
+                const fetchedRequests = await this.fetchRequestsFromUrl(source as InternalSource);
+                await this.addFetchedRequests(source as InternalSource, fetchedRequests);
             } else {
-                this._addRequest(source);
+                this.addRequest(source);
             }
         }
 
         // Drop the original array full of empty indexes.
-        this.sources = [];
+        this.#sources = [];
 
-        if (this.sourcesFunction) {
+        if (this.#sourcesFunction) {
             try {
-                const sourcesFromFunction = await this.sourcesFunction();
+                const sourcesFromFunction = await this.#sourcesFunction();
                 const sourcesFromFunctionCount = sourcesFromFunction.length;
                 for (let i = 0; i < sourcesFromFunctionCount; i++) {
-                    const source = sourcesFromFunction.shift();
-                    this._addRequest(source!);
+                    const source = sourcesFromFunction[i];
+                    // oxlint-disable-next-line typescript/no-array-delete -- intentional, drop the slot so V8 can collect the object
+                    delete sourcesFromFunction[i];
+                    this.addRequest(source);
                 }
+
+                sourcesFromFunction.length = 0;
             } catch (e) {
                 const err = e as Error;
                 throw new Error(`Loading requests with sourcesFunction failed.\nCause: ${err.message}`);
@@ -502,18 +566,24 @@ export class RequestList implements IRequestList {
      * @inheritDoc
      */
     async persistState(): Promise<void> {
-        if (!this.persistStateKey) {
+        if (!this.#persistStateKey) {
             throw new Error('Cannot persist state. options.persistStateKey is not set.');
         }
-        if (this.isStatePersisted) return;
         try {
-            this.store ??= await KeyValueStore.open();
-            await this.store.setValue(this.persistStateKey, this.getState());
-            this.isStatePersisted = true;
+            await this.#state.persistState();
         } catch (e) {
             const err = e as Error;
-            this.log.exception(err, 'Attempted to persist state, but failed.');
+            this.#log.exception(err, 'Attempted to persist state, but failed.');
         }
+    }
+
+    /**
+     * Removes the `PERSIST_STATE` event listener registered during initialization and persists
+     * the current state one last time. Call this when you are done with the `RequestList` to avoid
+     * leaking the listener (and the requests it retains) on the shared event manager.
+     */
+    async teardown(): Promise<void> {
+        await this.#state.teardown();
     }
 
     /**
@@ -521,102 +591,11 @@ export class RequestList implements IRequestList {
      * are automatically persisted at RequestList initialization (if the persistRequestsKey is set),
      * but there's no reason to persist it again afterwards, because RequestList is immutable.
      */
-    protected async _persistRequests(): Promise<void> {
+    private async persistRequests(): Promise<void> {
         const serializedRequests = await serializeArray(this.requests);
-        this.store ??= await KeyValueStore.open();
-        await this.store.setValue(this.persistRequestsKey!, serializedRequests, { contentType: CONTENT_TYPE_BINARY });
+        this.#store ??= await KeyValueStore.open();
+        await this.#store.setValue(this.#persistRequestsKey!, serializedRequests, { contentType: CONTENT_TYPE_BINARY });
         this.areRequestsPersisted = true;
-    }
-
-    /**
-     * Restores RequestList state from a state object.
-     */
-    protected _restoreState(state?: RequestListState): void {
-        // If there's no state it means we've not persisted any (yet).
-        if (!state) return;
-        // Restore previous state.
-        if (typeof state.nextIndex !== 'number' || state.nextIndex < 0) {
-            throw new Error('The state object is invalid: nextIndex must be a non-negative number.');
-        }
-        if (state.nextIndex > this.requests.length) {
-            throw new Error('The state object is not consistent with RequestList, too few requests loaded.');
-        }
-        if (
-            state.nextIndex < this.requests.length &&
-            this.requests[state.nextIndex].uniqueKey !== state.nextUniqueKey
-        ) {
-            throw new Error(
-                'The state object is not consistent with RequestList the order of URLs seems to have changed.',
-            );
-        }
-
-        const deleteFromInProgress: string[] = [];
-        state.inProgress.forEach((uniqueKey) => {
-            const index = this.uniqueKeyToIndex[uniqueKey];
-            if (typeof index !== 'number') {
-                throw new Error(
-                    'The state object is not consistent with RequestList. Unknown uniqueKey is present in the state.',
-                );
-            }
-            if (index >= state.nextIndex) {
-                deleteFromInProgress.push(uniqueKey);
-            }
-        });
-
-        this.nextIndex = state.nextIndex;
-        this.inProgress = new Set(state.inProgress);
-
-        // WORKAROUND:
-        // It happened to some users that state object contained something like:
-        // {
-        //   "nextIndex": 11308,
-        //   "nextUniqueKey": "https://www.anychart.com",
-        //   "inProgress": {
-        //      "https://www.ams360.com": true,
-        //      ...
-        //        "https://www.anychart.com": true,
-        // }
-        // Which then caused error "The request is not being processed (uniqueKey: https://www.anychart.com)"
-        // As a workaround, we just remove all inProgress requests whose index >= nextIndex,
-        // since they will be crawled again.
-        if (deleteFromInProgress.length) {
-            this.log.warning(
-                "RequestList's in-progress field is not consistent, skipping invalid in-progress entries",
-                {
-                    deleteFromInProgress,
-                },
-            );
-            for (const uniqueKey of deleteFromInProgress) {
-                this.inProgress.delete(uniqueKey);
-            }
-        }
-
-        // All in-progress requests need to be re-crawled
-        this.reclaimed = new Set(this.inProgress);
-    }
-
-    /**
-     * Attempts to load state and requests using the `RequestList` configuration
-     * and returns a tuple of [state, requests] where each may be null if not loaded.
-     */
-    protected async _loadStateAndPersistedRequests(): Promise<[RequestListState, Buffer]> {
-        let state!: RequestListState;
-        let persistedRequests!: Buffer;
-
-        if (this.initialState) {
-            state = this.initialState;
-            this.log.debug('Loaded state from options.state argument.');
-        } else if (this.persistStateKey) {
-            state = await this._getPersistedState(this.persistStateKey);
-            if (state) this.log.debug('Loaded state from key value store using the persistStateKey.');
-        }
-
-        if (this.persistRequestsKey) {
-            persistedRequests = await this._getPersistedState(this.persistRequestsKey);
-            if (persistedRequests) this.log.debug('Loaded requests from key value store using the persistRequestsKey.');
-        }
-
-        return [state, persistedRequests];
     }
 
     /**
@@ -624,54 +603,45 @@ export class RequestList implements IRequestList {
      * Note that the object's fields can change in future releases.
      */
     getState(): RequestListState {
-        this._ensureIsInitialized();
+        this.ensureIsInitialized();
 
-        return {
-            nextIndex: this.nextIndex,
-            nextUniqueKey: this.nextIndex < this.requests.length ? this.requests[this.nextIndex].uniqueKey! : null,
-            inProgress: [...this.inProgress],
-        };
+        return this.#stateCodec.encode(this.#state.currentValue);
     }
 
     /**
      * @inheritDoc
      */
-    async isEmpty(): Promise<boolean> {
-        this._ensureIsInitialized();
+    async checkReadiness(): Promise<RequestLoaderStatus> {
+        this.ensureIsInitialized();
 
-        return this.reclaimed.size === 0 && this.nextIndex >= this.requests.length;
-    }
+        if (this.#requestsToRetry.length > 0 || this.#state.currentValue.nextIndex < this.requests.length) {
+            return { status: 'ready' };
+        }
 
-    /**
-     * @inheritDoc
-     */
-    async isFinished(): Promise<boolean> {
-        this._ensureIsInitialized();
-
-        return this.inProgress.size === 0 && this.nextIndex >= this.requests.length;
+        // `#requestsToRetry` is a subset of `inProgress`, so nothing in progress means nothing left to re-serve.
+        return this.inProgress.size === 0 ? { status: 'finished' } : { status: 'waiting' };
     }
 
     /**
      * @inheritDoc
      */
     async fetchNextRequest(): Promise<Request | null> {
-        this._ensureIsInitialized();
+        this.ensureIsInitialized();
 
-        // First return reclaimed requests if any.
-        const uniqueKey = this.reclaimed.values().next().value;
+        // First re-serve any requests that were interrupted before the last state persist.
+        const uniqueKey = this.#requestsToRetry.shift();
         if (uniqueKey) {
-            this.reclaimed.delete(uniqueKey);
-            const index = this.uniqueKeyToIndex[uniqueKey];
+            const index = this.#uniqueKeyToIndex[uniqueKey];
             return this.ensureRequest(this.requests[index], index);
         }
 
         // Otherwise return next request.
-        if (this.nextIndex < this.requests.length) {
-            const index = this.nextIndex;
+        const state = this.#state.currentValue;
+        if (state.nextIndex < this.requests.length) {
+            const index = state.nextIndex;
             const request = this.requests[index];
-            this.inProgress.add(request.uniqueKey!);
-            this.nextIndex++;
-            this.isStatePersisted = false;
+            state.inProgress.add(request.uniqueKey!);
+            state.nextIndex++;
             return this.ensureRequest(request, index);
         }
 
@@ -701,43 +671,29 @@ export class RequestList implements IRequestList {
     /**
      * @inheritDoc
      */
-    async markRequestHandled(request: Request): Promise<void> {
+    async markRequestAsHandled(request: Request): Promise<void> {
         const { uniqueKey } = request;
 
-        this._ensureUniqueKeyValid(uniqueKey);
-        this._ensureInProgressAndNotReclaimed(uniqueKey);
-        this._ensureIsInitialized();
+        this.ensureUniqueKeyValid(uniqueKey);
+        this.ensureInProgress(uniqueKey);
+        this.ensureIsInitialized();
 
         this.inProgress.delete(uniqueKey);
-        this.isStatePersisted = false;
-    }
-
-    /**
-     * @inheritDoc
-     */
-    async reclaimRequest(request: Request): Promise<void> {
-        const { uniqueKey } = request;
-
-        this._ensureUniqueKeyValid(uniqueKey);
-        this._ensureInProgressAndNotReclaimed(uniqueKey);
-        this._ensureIsInitialized();
-
-        this.reclaimed.add(uniqueKey);
     }
 
     /**
      * Adds all fetched requests from a URL from a remote resource.
      */
-    protected async _addFetchedRequests(source: InternalSource, fetchedRequests: RequestOptions[]) {
+    private async addFetchedRequests(source: InternalSource, fetchedRequests: RequestOptions[]) {
         const { requestsFromUrl, regex } = source;
         const originalLength = this.requests.length;
 
-        fetchedRequests.forEach((request) => this._addRequest(request));
+        fetchedRequests.forEach((request) => this.addRequest(request));
 
         const fetchedCount = fetchedRequests.length;
         const importedCount = this.requests.length - originalLength;
 
-        this.log.info('Fetched and loaded Requests from a remote resource.', {
+        this.#log.info('Fetched and loaded Requests from a remote resource.', {
             requestsFromUrl,
             regex,
             fetchedCount,
@@ -747,9 +703,9 @@ export class RequestList implements IRequestList {
         });
     }
 
-    protected async _getPersistedState<T>(key: string): Promise<T> {
-        this.store ??= await KeyValueStore.open();
-        const state = await this.store.getValue<T>(key);
+    private async getPersistedState<T>(key: string): Promise<T> {
+        this.#store ??= await KeyValueStore.open();
+        const state = await this.#store.getValue<T>(key);
 
         return state!;
     }
@@ -757,16 +713,16 @@ export class RequestList implements IRequestList {
     /**
      * Fetches URLs from requestsFromUrl and returns them in format of list of requests
      */
-    protected async _fetchRequestsFromUrl(source: InternalSource): Promise<RequestOptions[]> {
+    private async fetchRequestsFromUrl(source: InternalSource): Promise<RequestOptions[]> {
         const { requestsFromUrl, regex, ...sharedOpts } = source;
 
         // Download remote resource and parse URLs.
         let urlsArr;
         try {
-            urlsArr = await this._downloadListOfUrls({
+            urlsArr = await this.downloadListOfUrls({
                 url: requestsFromUrl,
                 urlRegExp: regex,
-                proxyUrl: await this.proxyConfiguration?.newUrl(),
+                proxyUrl: (await this.#proxyConfiguration?.newProxyInfo())?.url,
             });
         } catch (err) {
             throw new Error(`Cannot fetch a request list from ${requestsFromUrl}: ${err}`);
@@ -774,7 +730,7 @@ export class RequestList implements IRequestList {
 
         // Skip if resource contained no URLs.
         if (!urlsArr.length) {
-            this.log.warning('The fetched list contains no valid URLs.', { requestsFromUrl, regex });
+            this.#log.warning('The fetched list contains no valid URLs.', { requestsFromUrl, regex });
             return [];
         }
 
@@ -786,7 +742,7 @@ export class RequestList implements IRequestList {
      * If the `source` parameter is a string or plain object and not an instance
      * of a `Request`, then the function creates a `Request` instance.
      */
-    protected _addRequest(source: RequestListSource) {
+    private addRequest(source: RequestListSource) {
         let request: Request | RequestOptions;
         const type = typeof source;
 
@@ -804,19 +760,19 @@ export class RequestList implements IRequestList {
         request.uniqueKey ??= Request.computeUniqueKey(request as any);
 
         // Add index to uniqueKey if duplicates are to be kept
-        if (this.keepDuplicateUrls && !hasUniqueKey) {
+        if (this.#keepDuplicateUrls && !hasUniqueKey) {
             request.uniqueKey += `-${this.requests.length}`;
         }
 
         const { uniqueKey } = request;
-        this._ensureUniqueKeyValid(uniqueKey);
+        this.ensureUniqueKeyValid(uniqueKey);
 
         // Skip requests with duplicate uniqueKey
-        if (!Object.hasOwn(this.uniqueKeyToIndex, uniqueKey)) {
-            this.uniqueKeyToIndex[uniqueKey] = this.requests.length;
+        if (!Object.hasOwn(this.#uniqueKeyToIndex, uniqueKey)) {
+            this.#uniqueKeyToIndex[uniqueKey] = this.requests.length;
             this.requests.push(request);
-        } else if (this.keepDuplicateUrls) {
-            this.log.warning(
+        } else if (this.#keepDuplicateUrls) {
+            this.#log.warning(
                 `Duplicate uniqueKey: ${uniqueKey} found while the keepDuplicateUrls option was set. Check your sources' unique keys.`,
             );
         }
@@ -826,29 +782,26 @@ export class RequestList implements IRequestList {
      * Helper function that validates unique key.
      * Throws an error if uniqueKey is not a non-empty string.
      */
-    protected _ensureUniqueKeyValid(uniqueKey: string): void {
+    private ensureUniqueKeyValid(uniqueKey: string): void {
         if (typeof uniqueKey !== 'string' || !uniqueKey) {
             throw new Error("Request object's uniqueKey must be a non-empty string");
         }
     }
 
     /**
-     * Checks that request is not reclaimed and throws an error if so.
+     * Checks that a request is currently being processed and throws an error if not.
      */
-    protected _ensureInProgressAndNotReclaimed(uniqueKey: string): void {
+    private ensureInProgress(uniqueKey: string): void {
         if (!this.inProgress.has(uniqueKey)) {
             throw new Error(`The request is not being processed (uniqueKey: ${uniqueKey})`);
-        }
-        if (this.reclaimed.has(uniqueKey)) {
-            throw new Error(`The request was already reclaimed (uniqueKey: ${uniqueKey})`);
         }
     }
 
     /**
      * Throws an error if request list wasn't initialized.
      */
-    protected _ensureIsInitialized(): void {
-        if (!this.isInitialized) {
+    private ensureIsInitialized(): void {
+        if (!this.#isInitialized) {
             throw new Error(
                 'RequestList is not initialized; you must call "await requestList.initialize()" before using it!',
             );
@@ -858,19 +811,41 @@ export class RequestList implements IRequestList {
     /**
      * Returns the total number of unique requests present in the `RequestList`.
      */
-    length(): number {
-        this._ensureIsInitialized();
+    async getTotalCount(): Promise<number> {
+        this.ensureIsInitialized();
 
         return this.requests.length;
     }
 
     /**
+     * Returns the number of pending requests in the `RequestList`.
+     */
+    async getPendingCount(): Promise<number> {
+        this.ensureIsInitialized();
+
+        return this.requests.length - (this.#state.currentValue.nextIndex - this.inProgress.size);
+    }
+
+    /**
+     * Combines this list with a request manager (a {@apilink RequestQueue} by default) into a
+     * {@apilink RequestManagerTandem}, allowing requests to be added and reclaimed while still
+     * being read from this list first.
+     */
+    async toTandem(requestManager?: IRequestManager): Promise<IRequestManager> {
+        // Import here to avoid circular imports.
+        const { RequestManagerTandem } = await import('./request_manager_tandem.js');
+        const { RequestQueue } = await import('./request_queue.js');
+
+        return new RequestManagerTandem(this, requestManager ?? (await RequestQueue.open()));
+    }
+
+    /**
      * @inheritDoc
      */
-    handledCount(): number {
-        this._ensureIsInitialized();
+    async getHandledCount(): Promise<number> {
+        this.ensureIsInitialized();
 
-        return this.nextIndex - this.inProgress.size;
+        return this.#state.currentValue.nextIndex - this.inProgress.size;
     }
 
     /**
@@ -941,12 +916,9 @@ export class RequestList implements IRequestList {
 
         const listName = listNameOrOptions;
 
-        ow(listName, ow.optional.any(ow.string, ow.null));
-        ow(sources, ow.array);
-        ow(
-            options,
-            ow.object.is((v) => !Array.isArray(v)),
-        );
+        parseArgument(listName, listNameSchema);
+        parseArgument(sources, schemas.anyArray);
+        parseArgument(options, openOptionsSchema);
 
         const rl = new RequestList({
             ...options,
@@ -962,12 +934,15 @@ export class RequestList implements IRequestList {
     /**
      * @internal wraps public utility for mocking purposes
      */
-    private async _downloadListOfUrls(options: {
+    private async downloadListOfUrls(options: {
         url: string;
         urlRegExp?: RegExp;
         proxyUrl?: string;
     }): Promise<string[]> {
-        return downloadListOfUrls(options);
+        return downloadListOfUrls({
+            ...options,
+            httpClient: this.#httpClient,
+        });
     }
 }
 
