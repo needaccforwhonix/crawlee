@@ -1,4 +1,4 @@
-import type { Request } from '@crawlee/core';
+import type { CrawlingRequest } from './crawling-request.js';
 import { RequestValidationError } from '@crawlee/core';
 import type { Awaitable, Dictionary } from '@crawlee/types';
 import type { StandardSchemaV1 } from '@standard-schema/spec';
@@ -10,7 +10,7 @@ import type {
     RestrictedCrawlingContext,
     TypedContextAddRequests,
     TypedContextEnqueueLinks,
-} from './crawlers/crawler_commons.js';
+} from './crawlers/crawler-commons.js';
 
 /**
  * The key of the default route — the fallback handler registered via {@apilink Router.addDefaultHandler}.
@@ -29,7 +29,7 @@ export type RouterHandlerContext<
     UserData extends Dictionary,
     Routes extends Record<keyof Routes, Dictionary>,
 > = Omit<Context, 'request' | 'addRequests' | 'enqueueLinks'> & {
-    request: LoadedRequest<Request<UserData>>;
+    request: LoadedRequest<CrawlingRequest<UserData>>;
     addRequests: TypedContextAddRequests<Routes>;
 } & (Context extends { enqueueLinks: infer EnqueueLinks }
         ? { enqueueLinks: TypedContextEnqueueLinks<EnqueueLinks, Routes> }
@@ -129,7 +129,7 @@ export interface RouterHandler<
     (ctx: Context): Awaitable<void>;
 }
 
-export type GetUserDataFromRequest<T> = T extends Request<infer Y> ? Y : never;
+export type GetUserDataFromRequest<T> = T extends CrawlingRequest<infer Y> ? Y : never;
 
 /**
  * Per-route overrides, passed as the last argument of {@apilink Router.addHandler|`addHandler`} and
@@ -147,7 +147,9 @@ export interface RouteOptions {
 }
 
 export type RouterRoutes<Context, Routes extends Record<keyof Routes, Dictionary>> = {
-    [Label in keyof Routes]: (ctx: Omit<Context, 'request'> & { request: Request<Routes[Label]> }) => Awaitable<void>;
+    [Label in keyof Routes]: (
+        ctx: Omit<Context, 'request'> & { request: CrawlingRequest<Routes[Label]> },
+    ) => Awaitable<void>;
 };
 
 /**
@@ -315,7 +317,7 @@ export class Router<
     ): void;
 
     addHandler(label: string | symbol, handler: (ctx: any) => Awaitable<void>, options: RouteOptions = {}): void {
-        this.validate(label);
+        this.#validate(label);
         this.#routes.set(label, handler);
 
         if (options.requestHandlerTimeoutSecs !== undefined) {
@@ -334,7 +336,7 @@ export class Router<
     addDefaultHandler<
         UserData extends Dictionary = DefaultRouteUserData<Routes, GetUserDataFromRequest<Context['request']>>,
     >(handler: (ctx: RouterHandlerContext<Context, UserData, Routes>) => Awaitable<void>, options: RouteOptions = {}) {
-        this.validate(defaultRoute);
+        this.#validate(defaultRoute);
         this.#routes.set(defaultRoute, handler);
 
         if (options.requestHandlerTimeoutSecs !== undefined) {
@@ -379,6 +381,7 @@ export class Router<
      * override it and the crawler's own timeout should apply. Falls back to the default route the same way
      * {@apilink Router.getHandler|`getHandler`} does, so a label with no route of its own inherits whatever
      * the default route asked for. Used by the crawler; not meant to be called directly.
+     * @internal
      */
     getTimeoutSecs(label?: string | symbol): number | undefined {
         if (label && this.#routes.has(label)) {
@@ -391,6 +394,7 @@ export class Router<
     /**
      * The longest `requestHandlerTimeoutSecs` any route asked for, or `undefined` when no route overrides it.
      * The crawler needs an upper bound up front, before it knows which routes a run will actually hit.
+     * @internal
      */
     getMaxTimeoutSecs(): number | undefined {
         return this.#timeouts.size > 0 ? Math.max(...this.#timeouts.values()) : undefined;
@@ -419,7 +423,7 @@ export class Router<
      * Validates `request.userData` against the schema registered for its label (if any), replacing it with
      * the parsed value. Throws a {@apilink RequestValidationError} when validation fails.
      */
-    private async validateRequest(context: Context) {
+    async #validateRequest(context: Context) {
         const label = context.request.label;
         const schema = this.getSchema(label);
 
@@ -435,7 +439,7 @@ export class Router<
     /**
      * Throws when the label already exists in our registry.
      */
-    private validate(label: string | symbol) {
+    #validate(label: string | symbol) {
         if (this.#routes.has(label)) {
             const message =
                 label === defaultRoute
@@ -514,7 +518,7 @@ export class Router<
             const { url, loadedUrl, label } = context.request;
             context.log.debug('Page opened.', { label, url: loadedUrl ?? url });
 
-            await router.validateRequest(context);
+            await router.#validateRequest(context);
 
             for (const middleware of router.#middlewares) {
                 await middleware(context);

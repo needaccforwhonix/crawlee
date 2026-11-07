@@ -108,9 +108,13 @@ describe('Statistics', () => {
             const record = (await store.getValue<StatisticPersistedState>(persistStateKey(stats)))!;
             await store.setValue(persistStateKey(stats), { ...record, requestsSucceeded: 'plenty' });
 
+            // The statistics log through a child of the registered logger; collapsing `child()` onto its
+            // parent lets the spy below observe it.
+            const logger = serviceLocator.getLogger();
+            vitest.spyOn(logger, 'child').mockReturnValue(logger);
+            const warningSpy = vitest.spyOn(logger, 'warning').mockImplementation(() => {});
+
             const restored = new Statistics({ id: stats.id });
-            // @ts-expect-error Accessing private prop
-            const warningSpy = vitest.spyOn(restored.log, 'warning').mockImplementation(() => {});
 
             // A corrupt counter must not take the crawl down with it, and must not be trusted either - an
             // increment on a string would poison every later one.
@@ -353,11 +357,15 @@ describe('Statistics', () => {
 
     test('should regularly log stats', async () => {
         const logged: [string, Dictionary | undefined | null][] = [];
-        // @ts-expect-error Accessing private prop
-        const infoSpy = vitest.spyOn(stats.log, 'info');
-        infoSpy.mockImplementation((message: string, data?: Record<string, any> | null) => {
+        // The statistics log through a child of the registered logger; collapsing `child()` onto its parent
+        // lets the spy below observe it.
+        const logger = serviceLocator.getLogger();
+        vitest.spyOn(logger, 'child').mockReturnValue(logger);
+        vitest.spyOn(logger, 'info').mockImplementation((message: string, data?: Record<string, any> | null) => {
             logged.push([message, data]);
         });
+
+        const stats = new Statistics();
 
         stats.recordRequestStart(0);
         vitest.advanceTimersByTime(1);
@@ -529,12 +537,16 @@ describe('Statistics', () => {
                     productsFound: 'plenty',
                 });
 
+                // The statistics log through a child of the registered logger; collapsing `child()` onto its
+                // parent lets the spy below observe it.
+                const logger = serviceLocator.getLogger();
+                vitest.spyOn(logger, 'child').mockReturnValue(logger);
+                const warningSpy = vitest.spyOn(logger, 'warning').mockImplementation(() => {});
+
                 const stats = new Statistics({
                     id: 'corrupt-custom-stats',
                     stateExtension: { deserialize: productsFound },
                 });
-                // @ts-expect-error Accessing private prop
-                const warningSpy = vitest.spyOn(stats.log, 'warning').mockImplementation(() => {});
 
                 await stats.startCapturing();
 
@@ -625,5 +637,44 @@ describe('Statistics', () => {
 
             await statsB.stopCapturing();
         });
+    });
+
+    test('should track retries in real-time and handle safeguards against negative/NaN indices', () => {
+        // TC-01: First retry increment
+        stats.registerRetry(1);
+        expect(stats.state.requestsRetries).toEqual(1);
+        expect(stats.requestRetryHistogram[1]).toEqual(1);
+
+        // TC-02: Subsequent retries decrement previous indices
+        stats.registerRetry(2);
+        expect(stats.state.requestsRetries).toEqual(1); // Should not increment again
+        expect(stats.requestRetryHistogram[2]).toEqual(1);
+        expect(stats.requestRetryHistogram[1]).toEqual(0); // Successfully decremented
+
+        // TC-04: Non-sequential retries (e.g., after migration / state restore)
+        // Simulate a job reporting a 4th retry out of nowhere
+        stats.registerRetry(4);
+        expect(stats.requestRetryHistogram[4]).toEqual(1);
+        expect(stats.requestRetryHistogram[3]).toEqual(0); // Filled with 0, not null/undefined
+        expect(stats.requestRetryHistogram[1]).toEqual(0);
+
+        // TC-03: Finish job with 0 retries (happy path without errors)
+        stats.recordRequestStart(10);
+        stats.recordRequestSuccess(10, 0);
+        expect(stats.requestRetryHistogram[0]).toEqual(1);
+
+        // Verify final array serialization safety (no sparse arrays or null values)
+        const serialized = JSON.parse(JSON.stringify(stats.toJSON()));
+        expect(serialized.requestRetryHistogram).not.toContain(null);
+        expect(serialized.requestRetryHistogram).toEqual([1, 0, 1, 0, 1]);
+    });
+
+    test('should handle invalid or negative retryCount safely', () => {
+        // Safeguard check against negative or invalid inputs to prevent infinite loops
+        stats.registerRetry(-1);
+        expect(stats.requestRetryHistogram.length).toEqual(0); // Should be ignored or not crash
+
+        stats.registerRetry(NaN);
+        expect(stats.requestRetryHistogram.length).toEqual(0); // Should be ignored or not crash
     });
 });

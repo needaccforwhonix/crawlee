@@ -4,7 +4,6 @@ import type {
     ErrorHandler,
     GetUserDataFromRequest,
     HttpCrawlerOptions,
-    InternalHttpHook,
     RequestHandler,
     RouterHandler,
     RouterRoutes,
@@ -13,6 +12,8 @@ import type {
 } from '@crawlee/http';
 import { DOMCrawler, Router } from '@crawlee/http';
 import type { Dictionary } from '@crawlee/types';
+import type { Cheerio } from 'cheerio';
+import type { AnyNode } from 'domhandler';
 
 import type { CheerioParseResult } from './cheerio-parser.js';
 import { cheerioParser } from './cheerio-parser.js';
@@ -30,23 +31,21 @@ export interface CheerioCrawlerOptions<
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     Routes extends Record<keyof Routes, Dictionary> = Record<string, UserData>,
     StatisticStateExtension extends object = {},
-> extends HttpCrawlerOptions<
-    CheerioCrawlingContext<UserData, JSONData>,
-    ContextExtension,
-    ExtendedContext,
-    Routes,
-    StatisticStateExtension
+> extends Omit<
+    HttpCrawlerOptions<
+        CheerioCrawlingContext<UserData, JSONData>,
+        ContextExtension,
+        ExtendedContext,
+        Routes,
+        StatisticStateExtension
+    >,
+    'contextPipelineBuilder'
 > {}
-
-export type CheerioHook<
-    UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-> = InternalHttpHook<CheerioCrawlingContext<UserData, JSONData>>;
 
 export interface CheerioCrawlingContext<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-> extends DOMCrawlingContext<CheerioParseResult, UserData, JSONData> {}
+> extends DOMCrawlingContext<CheerioParseResult, Cheerio<AnyNode>, Cheerio<AnyNode>, UserData, JSONData> {}
 
 export type CheerioRequestHandler<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
@@ -140,7 +139,15 @@ export class CheerioCrawler<
         GetUserDataFromRequest<CheerioCrawlingContext['request']>
     >,
     StatisticStateExtension extends object = {},
-> extends DOMCrawler<CheerioParseResult, ContextExtension, ExtendedContext, Routes, StatisticStateExtension> {
+> extends DOMCrawler<
+    CheerioParseResult,
+    Cheerio<AnyNode>,
+    Cheerio<AnyNode>,
+    ContextExtension,
+    ExtendedContext,
+    Routes,
+    StatisticStateExtension
+> {
     /**
      * All `CheerioCrawler` parameters are passed via an options object.
      */

@@ -1,5 +1,6 @@
 import type {
     AddRequestsBatchedResult,
+    CleanupRegistrar,
     ContextPipeline,
     CrawlingContext,
     EnqueueLinksOptions,
@@ -43,7 +44,11 @@ export interface DOMParseResult {
  * });
  * ```
  */
-export interface DOMParser<Parsed extends DOMParseResult> {
+export interface DOMParser<
+    Parsed extends DOMParseResult,
+    Selection extends ArrayLike<unknown> = ArrayLike<unknown>,
+    Single = unknown,
+> {
     /**
      * The context members {@apilink DOMParser.parse|`parse`} contributes, mapped to `true`. Used to build the
      * placeholders that report a helpful error when the members are accessed after `skipNavigation` - the `Record`
@@ -60,10 +65,16 @@ export interface DOMParser<Parsed extends DOMParseResult> {
     extractLinks(parsed: Parsed, selector: string, baseUrl: string): Awaitable<string[]>;
 
     /**
-     * Returns the current matches of `selector`. Only the count is used, by
-     * {@apilink DOMCrawlingContext.waitForSelector|`waitForSelector`}.
+     * Returns the current matches of `selector`, in whatever form the DOM implementation uses - this is what
+     * {@apilink DOMCrawlingContext.querySelectorAll|`querySelectorAll`} hands to the request handler.
      */
-    select(parsed: Parsed, selector: string): Awaitable<ArrayLike<unknown>>;
+    querySelectorAll(parsed: Parsed, selector: string): Awaitable<Selection>;
+
+    /**
+     * Returns the first match of `selector`, or `undefined` when there is none - this is what
+     * {@apilink DOMCrawlingContext.querySelectorOne|`querySelectorOne`} hands to the request handler.
+     */
+    querySelectorOne(parsed: Parsed, selector: string): Awaitable<Single | undefined>;
 
     /**
      * Whether the parse result can change after {@apilink DOMParser.parse|`parse`} returned - the case when the DOM
@@ -86,7 +97,7 @@ export interface DOMParser<Parsed extends DOMParseResult> {
     cleanup?(parsed: Parsed): Awaitable<void>;
 }
 
-export interface DOMCrawlingHelpers {
+export interface DOMCrawlingHelpers<Selection extends ArrayLike<unknown> = ArrayLike<unknown>, Single = unknown> {
     /**
      * Extracts URLs from the parsed DOM, without adding them to the request queue.
      */
@@ -115,6 +126,17 @@ export interface DOMCrawlingHelpers {
     waitForSelector(selector: string, timeoutMs?: number): Promise<void>;
 
     /**
+     * Like {@apilink DOMCrawlingHelpers.waitForSelector|`waitForSelector`}, but returns the matches in the form
+     * the parser produces them - a Cheerio object in {@apilink CheerioCrawler}. Throws when nothing matches.
+     */
+    querySelectorAll(selector: string, timeoutMs?: number): Promise<Selection>;
+
+    /**
+     * Like {@apilink DOMCrawlingHelpers.querySelectorAll|`querySelectorAll`}, but returns only the first match.
+     */
+    querySelectorOne(selector: string, timeoutMs?: number): Promise<Single>;
+
+    /**
      * Returns Cheerio handle, allowing to work with the data same way as with {@apilink CheerioCrawler}.
      * When provided with the `selector` argument, it will throw if it's not available.
      *
@@ -131,28 +153,42 @@ export interface DOMCrawlingHelpers {
 
 export type DOMCrawlingContext<
     Parsed extends DOMParseResult = DOMParseResult,
+    Selection extends ArrayLike<unknown> = ArrayLike<unknown>,
+    Single = unknown,
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-> = InternalHttpCrawlingContext<UserData, JSONData> & Parsed & DOMCrawlingHelpers;
+> = Omit<InternalHttpCrawlingContext<UserData, JSONData>, keyof DOMCrawlingHelpers> &
+    Parsed &
+    DOMCrawlingHelpers<Selection, Single>;
 
 export interface DOMCrawlerOptions<
     Parsed extends DOMParseResult = DOMParseResult,
+    Selection extends ArrayLike<unknown> = ArrayLike<unknown>,
+    Single = unknown,
     ContextExtension = Dictionary<never>,
-    ExtendedContext extends DOMCrawlingContext<Parsed> = DOMCrawlingContext<Parsed> & ContextExtension,
+    ExtendedContext extends DOMCrawlingContext<Parsed, Selection, Single> = DOMCrawlingContext<
+        Parsed,
+        Selection,
+        Single
+    > &
+        ContextExtension,
     Routes extends Record<keyof Routes, Dictionary> = Record<string, any>,
     StatisticStateExtension extends object = {},
-> extends HttpCrawlerOptions<
-    DOMCrawlingContext<Parsed>,
-    ContextExtension,
-    ExtendedContext,
-    Routes,
-    StatisticStateExtension
+> extends Omit<
+    HttpCrawlerOptions<
+        DOMCrawlingContext<Parsed, Selection, Single>,
+        ContextExtension,
+        ExtendedContext,
+        Routes,
+        StatisticStateExtension
+    >,
+    'contextPipelineBuilder'
 > {
     /**
      * The DOM implementation to parse the response bodies with. Its parse result becomes part of the crawling
      * context, so the members the request handler receives follow from the parser you pass.
      */
-    parser: DOMParser<Parsed>;
+    parser: DOMParser<Parsed, Selection, Single>;
 }
 
 /**
@@ -166,48 +202,64 @@ export interface DOMCrawlerOptions<
  */
 export class DOMCrawler<
     Parsed extends DOMParseResult = DOMParseResult,
+    Selection extends ArrayLike<unknown> = ArrayLike<unknown>,
+    Single = unknown,
     ContextExtension = Dictionary<never>,
-    ExtendedContext extends DOMCrawlingContext<Parsed> = DOMCrawlingContext<Parsed> & ContextExtension,
+    ExtendedContext extends DOMCrawlingContext<Parsed, Selection, Single> = DOMCrawlingContext<
+        Parsed,
+        Selection,
+        Single
+    > &
+        ContextExtension,
     Routes extends Record<keyof Routes, Dictionary> = Record<
         string,
-        GetUserDataFromRequest<DOMCrawlingContext<Parsed>['request']>
+        GetUserDataFromRequest<DOMCrawlingContext<Parsed, Selection, Single>['request']>
     >,
     StatisticStateExtension extends object = {},
-> extends HttpCrawler<DOMCrawlingContext<Parsed>, ContextExtension, ExtendedContext, Routes, StatisticStateExtension> {
-    readonly #parser: DOMParser<Parsed>;
+> extends HttpCrawler<
+    DOMCrawlingContext<Parsed, Selection, Single>,
+    ContextExtension,
+    ExtendedContext,
+    Routes,
+    StatisticStateExtension
+> {
+    readonly #parser: DOMParser<Parsed, Selection, Single>;
 
     constructor(
-        options: DOMCrawlerOptions<Parsed, ContextExtension, ExtendedContext, Routes, StatisticStateExtension>,
+        options: DOMCrawlerOptions<
+            Parsed,
+            Selection,
+            Single,
+            ContextExtension,
+            ExtendedContext,
+            Routes,
+            StatisticStateExtension
+        >,
     ) {
-        const { parser, contextPipelineBuilder, ...rest } = options;
+        const { parser, ...rest } = options;
 
-        super({
-            ...rest,
-            contextPipelineBuilder: contextPipelineBuilder ?? (() => this.buildContextPipeline()),
-        });
+        super({ ...rest, contextPipelineBuilder: () => this.buildContextPipeline() });
 
         this.#parser = parser;
     }
 
-    protected override buildContextPipeline(): ContextPipeline<CrawlingContext, DOMCrawlingContext<Parsed>> {
+    protected override buildContextPipeline(): ContextPipeline<
+        CrawlingContext,
+        DOMCrawlingContext<Parsed, Selection, Single>
+    > {
         return super
             .buildContextPipeline()
-            .compose({
-                action: async (context) => this.#parseContent(context),
-                cleanup: async (context) => {
-                    // The `skipNavigation` placeholders below throw on access, so there is nothing to clean up.
-                    if (!context.request.skipNavigation) {
-                        await this.#parser.cleanup?.(context as unknown as Parsed);
-                    }
-                },
-            })
-            .compose({ action: async (context) => this.#addHelpers(context) });
+            .compose(this.#parseContent.bind(this))
+            .compose(async (context) => this.#addHelpers(context));
     }
 
-    async #parseContent(context: InternalHttpCrawlingContext): Promise<Parsed> {
+    async #parseContent(context: InternalHttpCrawlingContext, onCleanup: CleanupRegistrar): Promise<Parsed> {
         try {
-            return await this.#parser.parse(context);
+            const parsed = await this.#parser.parse(context);
+            onCleanup(() => this.#parser.cleanup?.(parsed));
+            return parsed;
         } catch (err) {
+            // The `skipNavigation` placeholders below throw on access, so there is nothing to clean up.
             if (err instanceof NavigationSkippedError) {
                 return Object.defineProperties(
                     {},
@@ -244,22 +296,52 @@ export class DOMCrawler<
                 options?.baseUrl ?? context.request.loadedUrl ?? context.request.url,
             );
 
-        const waitForSelector = async (selector: string, timeoutMs = 5_000): Promise<void> => {
+        // Polls `query` while `isEmpty` holds, for as long as a mutable parser allows; a static one gets one shot.
+        const poll = async <T>(
+            selector: string,
+            timeoutMs: number,
+            query: () => Awaitable<T>,
+            isEmpty: (result: T) => boolean,
+        ): Promise<T> => {
             let remaining = parser.mutable ? timeoutMs : 0;
+            let result = await query();
 
-            while ((await parser.select(context, selector)).length === 0) {
+            while (isEmpty(result)) {
                 if (remaining <= 0) {
                     throw new Error(`Selector '${selector}' not found.`);
                 }
 
                 await sleep(50);
                 remaining -= 50;
+                result = await query();
             }
+
+            return result;
+        };
+
+        const querySelectorAll = async (selector: string, timeoutMs = 5_000): Promise<Selection> =>
+            poll(
+                selector,
+                timeoutMs,
+                () => parser.querySelectorAll(context, selector),
+                (matches) => matches.length === 0,
+            );
+
+        const waitForSelector = async (selector: string, timeoutMs?: number): Promise<void> => {
+            await querySelectorAll(selector, timeoutMs);
         };
 
         return {
             extractLinks,
             waitForSelector,
+            querySelectorAll,
+            querySelectorOne: async (selector: string, timeoutMs = 5_000): Promise<Single> =>
+                poll(
+                    selector,
+                    timeoutMs,
+                    () => parser.querySelectorOne(context, selector),
+                    (match) => match === undefined,
+                ) as Promise<Single>,
             enqueueLinks: async (options: EnqueueLinksOptions = {}) => {
                 const baseUrl = resolveBaseUrlForEnqueueLinksFiltering({
                     enqueueStrategy: options.strategy,
@@ -276,14 +358,18 @@ export class DOMCrawler<
                     strategy: options.strategy ?? EnqueueStrategy.SameHostname,
                 });
             },
-            async parseWithCheerio(selector?: string, _timeoutMs = 5_000) {
-                const $ = (await parser.toCheerio?.(context)) ?? (await import('cheerio')).load(context.body);
-
-                if (selector && $(selector).get().length === 0) {
-                    throw new Error(`Selector '${selector}' not found.`);
+            async parseWithCheerio(selector?: string, timeoutMs?: number) {
+                if (selector) {
+                    await waitForSelector(selector, timeoutMs);
                 }
 
-                return $;
+                // Import full cheerio (not cheerio/slim) to be browser-compliant for DOM Crawlers (not CheerioCrawler).
+                return (
+                    (await parser.toCheerio?.(context)) ??
+                    (await import('cheerio')).load(context.body, {
+                        xmlMode: context.contentType.type.includes('xml'),
+                    })
+                );
             },
         };
     }

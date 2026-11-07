@@ -2,7 +2,7 @@ import { htmlToText } from '@crawlee/utils';
 import type { CheerioAPI } from 'cheerio';
 import * as cheerio from 'cheerio';
 
-import * as htmlToTextData from '../shared/data/html_to_text_test_data.js';
+import * as htmlToTextData from '../shared/data/html-to-text-test-data.js';
 
 const checkHtmlToText = async (html: string | CheerioAPI, expectedText: string, hasBody = false) => {
     const text1 = await htmlToText(html);
@@ -74,6 +74,9 @@ describe('htmlToText()', () => {
 
         await checkHtmlToText('<b>A  B  C  D  E\n\nF  G</b>', 'A B C D E F G');
         await checkHtmlToText('<pre>A  B  C  D  E\n\nF  G</pre>', 'A  B  C  D  E\n\nF  G');
+        await checkHtmlToText('<pre><code>A  B\n  C</code></pre>', 'A  B\n  C');
+        await checkHtmlToText('<pre>A  <b>B\n  <i>C  D</i></b></pre>', 'A  B\n  C  D');
+        await checkHtmlToText('<pre><code><span>a</span><br><span>    b</span></code></pre>', 'a\n    b');
 
         await checkHtmlToText(
             '<h1>Heading 1</h1><div><div><div><div>Deep  Div</div></div></div></div><h2>Heading       2</h2>',
@@ -105,6 +108,15 @@ describe('htmlToText()', () => {
         const { html, text } = htmlToTextData;
         // Careful here - don't change any whitespace in the text below or the test will break, even trailing!
         await checkHtmlToText(html, text, true);
+    });
+
+    test('handles documents with many nodes in linear time', async () => {
+        const count = 160_000;
+        const html = `<html><body><div>${'<i> a</i>'.repeat(count)}</div></body></html>`;
+        const start = performance.now();
+        const text = await htmlToText(html);
+        expect(performance.now() - start).toBeLessThan(2_000);
+        expect(text).toEqual('a'.repeat(count).split('').join(' '));
     });
 
     test('works with Cheerio object', async () => {
